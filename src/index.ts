@@ -1,3 +1,4 @@
+import "dotenv/config";
 import {
   StateGraph,
   StateSchema,
@@ -9,30 +10,54 @@ import {
 } from "@langchain/langgraph";
 
 import * as z from "zod";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createPlannerNode } from "./nodes/planner.node.js";
+
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+if (!anthropicApiKey || anthropicApiKey === "your_anthropic_api_key_here") {
+  console.warn("⚠️  Warning: ANTHROPIC_API_KEY is missing or using placeholder in .env.");
+}
+
+const claudeModel = new ChatAnthropic({
+  apiKey: anthropicApiKey || "dummy_key_for_init",
+  model: process.env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-latest",
+  temperature: 0,
+});
+
+const plannerNode = createPlannerNode(claudeModel);
 
 // 1. Define State
 const AgentState = new StateSchema({
+  // Thông tin task
   task: z.string(),
+
+  // Planner
   plan: z.array(z.string()).default(() => []),
+
+  // Analyst
   analysis: z.string().default(""),
-  requiresDevelopment: z.boolean().default(false),
-  approved: z.boolean().default(false)
+
+  // Human approval
+  approved: z.boolean().default(false),
+
+  // Developer
+  implementation: z.string().default(""),
+
+  // Reviewer
+  reviewStatus: z.enum([
+    "pending",
+    "approved",
+    "changes_requested"
+  ]).default("pending"),
+
+  reviewFeedback: z.string().default(""),
+
+  // Số lần Developer sửa code
+  revisionCount: z.number().default(0),
+
+  // Documentation
+  documentation: z.string().default("")
 });
-
-// 2. Planner Node
-const plannerNode = async (
-  state: typeof AgentState.State
-) => {
-  console.log("Planner is working...");
-
-  return {
-    plan: [
-      "Analyze project architecture",
-      "Identify affected files",
-      "Define implementation steps"
-    ]
-  };
-};
 
 // 3. Analyst Node
 const analystNode = async (
@@ -40,29 +65,10 @@ const analystNode = async (
 ) => {
   console.log("Analyst is working...");
 
-  const task = state.task.toLowerCase();
-
-  const requiresDevelopment =
-    task.includes("implement") ||
-    task.includes("build");
-
   return {
-    analysis: `Analyzed task: ${state.task}.
-Plan contains ${state.plan.length} steps.`,
-    requiresDevelopment
-  };
-};
-
-// Development Node
-const developerNode = async (
-  state: typeof AgentState.State
-) => {
-  console.log("Developer is working...");
-
-  return {
-    analysis:
-      state.analysis +
-      "\nDeveloper implementation completed."
+    analysis: `Task: ${state.task}
+Plan steps: ${state.plan.length}
+Target feature: User Management`
   };
 };
 
@@ -73,9 +79,9 @@ const humanReviewNode = async (
   console.log("Waiting for human approval...");
 
   const decision = interrupt({
-    message: "Please review the implementation plan",
     task: state.task,
-    plan: state.plan
+    plan: state.plan,
+    analysis: state.analysis
   });
 
   return {
@@ -83,21 +89,89 @@ const humanReviewNode = async (
   };
 };
 
-// Hàm điều hướng
-const routeAfterAnalyst = (
+// Development Node
+const developerNode = async (
   state: typeof AgentState.State
 ) => {
-  return state.requiresDevelopment
-    ? "developer"
-    : END;
+  console.log("Developer is working...");
+
+  const nextRevision = state.revisionCount + 1;
+
+  return {
+    implementation:
+      `User Management implementation, revision ${nextRevision}`,
+
+    revisionCount: nextRevision
+  };
 };
 
-const routeAfterReview = (
+// Reviewer Node
+const reviewerNode = async (
   state: typeof AgentState.State
 ) => {
-  return state.approved
-    ? "developer"
-    : END;
+  console.log("Reviewer is working...");
+
+  if (state.revisionCount < 2) {
+    return {
+      reviewStatus: "changes_requested" as const,
+      reviewFeedback:
+        "Please improve validation and error handling."
+    };
+  }
+
+  return {
+    reviewStatus: "approved" as const,
+    reviewFeedback: "Implementation looks good."
+  };
+};
+
+// Documentation Node
+const documentationNode = async (
+  state: typeof AgentState.State
+) => {
+  console.log("Documentation is working...");
+
+  return {
+    documentation:
+      `Documentation for ${state.task}\n` +
+      `Implementation: ${state.implementation}\n` +
+      `Review: ${state.reviewFeedback}`
+  };
+};
+
+
+// Điều hướng sau khi Human Review
+const routeAfterHumanReview = (
+  state: typeof AgentState.State
+): "developer" | typeof END => {
+  return state.approved ? "developer" : END;
+};
+
+// Điều hướng sau khi Reviewer
+const routeAfterReviewer = (
+  state: typeof AgentState.State
+): "developer" | "documentationWriter" | "escalation" => {
+  if (state.reviewStatus === "approved") {
+    return "documentationWriter";
+  }
+
+  if (state.revisionCount < 3) {
+    return "developer";
+  }
+
+  return "escalation";
+};
+
+const escalationNode = async (
+  state: typeof AgentState.State
+) => {
+  console.log("Escalating to human...");
+
+  return {
+    reviewFeedback:
+      state.reviewFeedback +
+      "\nMaximum revision limit reached. Human intervention required."
+  };
 };
 
 // 4. Build Graph
@@ -108,6 +182,9 @@ const graph = new StateGraph(AgentState)
   .addNode("analyst", analystNode)
   .addNode("humanReview", humanReviewNode)
   .addNode("developer", developerNode)
+  .addNode("reviewer", reviewerNode)
+  .addNode("documentationWriter", documentationNode)
+  .addNode("escalation", escalationNode)
 
   .addEdge(START, "planner")
   .addEdge("planner", "analyst")
@@ -115,10 +192,18 @@ const graph = new StateGraph(AgentState)
 
   .addConditionalEdges(
     "humanReview",
-    routeAfterReview
+    routeAfterHumanReview
   )
 
-  .addEdge("developer", END)
+  .addEdge("developer", "reviewer")
+
+  .addConditionalEdges(
+    "reviewer",
+    routeAfterReviewer
+  )
+
+  .addEdge("documentationWriter", END)
+  .addEdge("escalation", END)
 
   .compile({ checkpointer });
 
@@ -132,23 +217,16 @@ const config = {
 async function main() {
   const result = await graph.invoke(
     {
-        task: "Implement User Management feature"
+      task: "Implement User Management feature for Admin role"
     },
-    config
+    {
+      configurable: {
+        thread_id: "SM-25"
+      }
+    }
   );
 
-  console.log("Workflow paused:", result);
-
-  const resumeResult = await graph.invoke(
-  new Command({
-    resume: "approve"
-  }),
-  config
-);
-
-console.log("Workflow completed:", resumeResult);
-
-
+  console.log("Workflow result:", result);
 }
 
 main().catch((error) => {
